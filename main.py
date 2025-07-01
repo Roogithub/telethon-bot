@@ -516,7 +516,8 @@ async def build_epub_async(title, chapters, image_paths, output_path, progress_m
     book.spine = spine
     book.toc = toc
     book.add_item(epub.EpubNcx())
-  current_step += 1
+    
+    current_step += 1
     progress_bar = create_progress_bar(current_step, total_steps)
     await progress_msg.edit(f"📚 Сохранение EPUB...\n{progress_bar}")
     
