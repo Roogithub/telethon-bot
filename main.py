@@ -73,7 +73,6 @@ async def start(event):
         "Здравствуйте. Вас приветствует Адикия — бот для работы с документами.\n\n"
         "Возможности:\n"
         "• Сжатие или удаление изображений в .epub, .fb2, .docx\n"
-        "• Конвертация файлов: .epub, .fb2, .docx, .txt\n"
         "• Извлечение глав из EPUB и пересборка с оглавлением\n\n"
         "Используйте /help для получения списка команд."
     )
@@ -85,7 +84,6 @@ async def help_command(event):
         "/start    - Начать работу с ботом\n"
         "/help     - Показать эту справку\n"
         "/compress - Сжать или удалить изображения в .epub/.fb2/.docx\n"
-        "/convert  - Конвертировать файл (.epub/.fb2/.docx/.txt)\n"
         "/extract  - Извлечь главы из EPUB и пересобрать\n"
         "/cancel   - Отменить текущую операцию\n"
     )
@@ -101,11 +99,6 @@ async def cancel(event):
 async def compress_cmd(event):
     user_mode[event.sender_id] = 'compress'
     await event.respond("Пожалуйста, отправьте файл .epub, .fb2 или .docx для обработки изображений.")
-
-@client.on(events.NewMessage(pattern='/convert'))
-async def convert_cmd(event):
-    user_mode[event.sender_id] = 'convert'
-    await event.respond("Пожалуйста, отправьте файл одного из поддерживаемых форматов: .epub, .fb2, .docx, .txt")
 
 @client.on(events.NewMessage(pattern='/extract'))
 async def extract_cmd(event):
@@ -158,13 +151,6 @@ async def handle_file(event):
         buttons = [Button.inline(label, data=label.encode()) for label in RESOLUTIONS]
         await event.respond("Выберите способ обработки изображений:", buttons=buttons)
 
-    elif mode == 'convert' and ext in ['.epub', '.fb2', '.docx', '.txt']:
-        buttons = [
-            [Button.inline("В DOCX", b"to_docx"), Button.inline("В FB2", b"to_fb2")],
-            [Button.inline("В EPUB", b"to_epub"), Button.inline("В TXT", b"to_txt")]
-        ]
-        await event.respond("Выберите формат для конвертации:", buttons=buttons)
-
     elif mode == 'extract' and ext == '.epub':
         await event.respond("Файл получен. Начинаю обработку...")
         try:
@@ -213,28 +199,6 @@ async def handle_button(event):
             await process_docx(event, user_id, filename, filepath, resolution)
         elif ext == '.epub':
             await process_epub_compression(event, user_id, filename, filepath, resolution)
-
-    elif mode == 'convert':
-        target_ext = data.replace("to_", ".")
-        if ext == target_ext:
-            await event.respond("Файл уже в этом формате.")
-            await client.send_file(user_id, filepath)
-        else:
-            convert_progress = await event.respond("🔄 Конвертация файла...\n░░░░░░░░░░░░░░░░░░░░ 0%")
-            await asyncio.sleep(0.5)  # Имитация обработки
-            await convert_progress.edit("🔄 Конвертация файла...\n▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░ 50%")
-            await asyncio.sleep(0.5)
-            
-            new_path = os.path.join(tempfile.gettempdir(), os.path.splitext(filename)[0] + target_ext)
-            with open(filepath, 'rb') as src, open(new_path, 'wb') as dst:
-                dst.write(src.read())
-            
-            await convert_progress.edit("🔄 Конвертация файла...\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 100%")
-            await asyncio.sleep(0.5)
-            await convert_progress.delete()
-            
-            await client.send_file(user_id, new_path, caption="Конвертация завершена.")
-            os.remove(new_path)
 
     os.remove(filepath)
     user_files.pop(user_id, None)
@@ -516,6 +480,7 @@ async def build_epub_async(title, chapters, image_paths, output_path, progress_m
     book.spine = spine
     book.toc = toc
     book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
     
     current_step += 1
     progress_bar = create_progress_bar(current_step, total_steps)
