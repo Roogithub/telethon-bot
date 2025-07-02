@@ -9,6 +9,7 @@ import warnings
 import asyncio
 
 from telethon import TelegramClient, events, Button
+from telethon.errors import MessageNotModifiedError
 from ebooklib import epub
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from PIL import Image
@@ -34,6 +35,8 @@ RESOLUTIONS = {
 
 user_files = {}
 user_mode = {}
+# Добавляем словарь для хранения последнего текста сообщения
+last_message_text = {}
 
 # Улучшенное регулярное выражение для поиска глав
 CHAPTER_RE = re.compile(
@@ -65,6 +68,20 @@ def should_update_progress(current, total, last_updated_percent):
     current_percent = int((current / total) * 100)
     # Обновляем только при изменении на 5% или больше
     return current_percent - last_updated_percent >= 5
+
+# Безопасное редактирование сообщения
+async def safe_edit_message(message, new_text):
+    """Редактирует сообщение только если текст изменился"""
+    try:
+        message_id = message.id
+        if message_id not in last_message_text or last_message_text[message_id] != new_text:
+            await message.edit(new_text)
+            last_message_text[message_id] = new_text
+    except MessageNotModifiedError:
+        # Игнорируем ошибку, если сообщение не изменилось
+        pass
+    except Exception as e:
+        logging.error(f"Error editing message: {e}")
 
 # Команды
 @client.on(events.NewMessage(pattern='/start'))
@@ -129,16 +146,14 @@ async def handle_file(event):
         nonlocal last_percent
         if total > 0 and should_update_progress(current, total, last_percent):
             progress_bar = create_progress_bar(current, total)
-            try:
-                await progress_msg.edit(f"📥 Загрузка файла...\n{progress_bar}")
-                last_percent = int((current / total) * 100)
-            except:
-                pass  # Игнорируем ошибки редактирования
+            new_text = f"📥 Загрузка файла...\n{progress_bar}"
+            await safe_edit_message(progress_msg, new_text)
+            last_percent = int((current / total) * 100)
     
     await client.download_media(event.message, file=file_data, progress_callback=progress_callback)
     file_data.seek(0)
 
-    await progress_msg.edit("📥 Загрузка завершена! Сохранение файла...")
+    await safe_edit_message(progress_msg, "📥 Загрузка завершена! Сохранение файла...")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(file_data.read())
@@ -146,6 +161,8 @@ async def handle_file(event):
 
     user_files[user_id] = (filename, tmp_path)
     await progress_msg.delete()
+    # Очищаем словарь от удалённого сообщения
+    last_message_text.pop(progress_msg.id, None)
 
     if mode == 'compress' and ext in ['.epub', '.fb2', '.docx']:
         buttons = [Button.inline(label, data=label.encode()) for label in RESOLUTIONS]
@@ -164,6 +181,7 @@ async def handle_file(event):
             build_progress = await event.respond("📚 Сборка EPUB...\n░░░░░░░░░░░░░░░░░░░░ 0%")
             await build_epub_async(base, chapters, images, output_path, build_progress)
             await build_progress.delete()
+            last_message_text.pop(build_progress.id, None)
             
             await client.send_file(user_id, output_path, caption="EPUB пересобран с оглавлением.")
             os.remove(output_path)
@@ -226,7 +244,8 @@ async def process_fb2(event, user_id, filename, filepath, resolution):
         if should_update_progress(current, total, last_percent):
             progress_bar = create_progress_bar(current, total)
             action = "Удаление" if resolution is None else "Сжатие"
-            await progress_msg.edit(f"🖼️ {action} изображений FB2...\n{progress_bar}")
+            new_text = f"🖼️ {action} изображений FB2...\n{progress_bar}"
+            await safe_edit_message(progress_msg, new_text)
             last_percent = int((current / total) * 100)
 
         if resolution is None:
@@ -244,12 +263,13 @@ async def process_fb2(event, user_id, filename, filepath, resolution):
             except Exception:
                 continue
 
-    await progress_msg.edit("💾 Сохранение файла...")
+    await safe_edit_message(progress_msg, "💾 Сохранение файла...")
     base, ext = os.path.splitext(filename)
     out_path = os.path.join(tempfile.gettempdir(), f"{base}_compressed{ext}")
     tree.write(out_path, encoding='utf-8', xml_declaration=True)
     
     await progress_msg.delete()
+    last_message_text.pop(progress_msg.id, None)
     await client.send_file(user_id, out_path, caption=f"✅ Готово: сжато {changed}, удалено {deleted}")
     os.remove(filepath)
     os.remove(out_path)
@@ -271,7 +291,8 @@ async def process_docx(event, user_id, filename, filepath, resolution):
         for current, shape in enumerate(doc.inline_shapes, 1):
             if should_update_progress(current, total, last_percent):
                 progress_bar = create_progress_bar(current, total)
-                await progress_msg.edit(f"🖼️ Удаление изображений DOCX...\n{progress_bar}")
+                new_text = f"🖼️ Удаление изображений DOCX...\n{progress_bar}"
+                await safe_edit_message(progress_msg, new_text)
                 last_percent = int((current / total) * 100)
             
             try:
@@ -283,7 +304,8 @@ async def process_docx(event, user_id, filename, filepath, resolution):
         for current, shape in enumerate(doc.inline_shapes, 1):
             if should_update_progress(current, total, last_percent):
                 progress_bar = create_progress_bar(current, total)
-                await progress_msg.edit(f"🖼️ Сжатие изображений DOCX...\n{progress_bar}")
+                new_text = f"🖼️ Сжатие изображений DOCX...\n{progress_bar}"
+                await safe_edit_message(progress_msg, new_text)
                 last_percent = int((current / total) * 100)
             
             try:
@@ -298,12 +320,13 @@ async def process_docx(event, user_id, filename, filepath, resolution):
             except Exception:
                 continue
 
-    await progress_msg.edit("💾 Сохранение документа...")
+    await safe_edit_message(progress_msg, "💾 Сохранение документа...")
     base, ext = os.path.splitext(filename)
     out_path = os.path.join(tempfile.gettempdir(), f"{base}_compressed{ext}")
     doc.save(out_path)
     
     await progress_msg.delete()
+    last_message_text.pop(progress_msg.id, None)
     await client.send_file(user_id, out_path, caption=f"✅ Готово: сжато {changed}, удалено {deleted}")
     os.remove(filepath)
     os.remove(out_path)
@@ -326,7 +349,8 @@ async def process_epub_compression(event, user_id, filename, filepath, resolutio
         if should_update_progress(current, total, last_percent):
             progress_bar = create_progress_bar(current, total)
             action = "Удаление" if resolution is None else "Сжатие"
-            await progress_msg.edit(f"🖼️ {action} изображений EPUB...\n{progress_bar}")
+            new_text = f"🖼️ {action} изображений EPUB...\n{progress_bar}"
+            await safe_edit_message(progress_msg, new_text)
             last_percent = int((current / total) * 100)
 
         if resolution is None:
@@ -344,12 +368,13 @@ async def process_epub_compression(event, user_id, filename, filepath, resolutio
             except Exception:
                 continue
 
-    await progress_msg.edit("💾 Сохранение EPUB...")
+    await safe_edit_message(progress_msg, "💾 Сохранение EPUB...")
     base, ext = os.path.splitext(filename)
     out_path = os.path.join(tempfile.gettempdir(), f"{base}_compressed{ext}")
     epub.write_epub(out_path, book)
     
     await progress_msg.delete()
+    last_message_text.pop(progress_msg.id, None)
     await client.send_file(user_id, out_path, caption=f"✅ Готово: сжато {changed}, удалено {deleted}")
     os.remove(filepath)
     os.remove(out_path)
@@ -365,7 +390,7 @@ async def extract_chapters_from_epub_async(epub_path, event):
     with zipfile.ZipFile(epub_path, 'r') as zf:
         zf.extractall(temp_dir)
 
-    await progress_msg.edit("📖 Анализ содержимого...\n▓▓▓▓▓░░░░░░░░░░░░░░░ 25%")
+    await safe_edit_message(progress_msg, "📖 Анализ содержимого...\n▓▓▓▓▓░░░░░░░░░░░░░░░ 25%")
     
     all_files = []
     for root, _, files in os.walk(temp_dir):
@@ -387,9 +412,10 @@ async def extract_chapters_from_epub_async(epub_path, event):
         if processed % 10 == 0:  # Обновляем каждые 10 файлов
             progress = int((processed / total_files) * 25) + 25
             progress_bar = "▓" * (progress // 5) + "░" * (20 - progress // 5)
-            await progress_msg.edit(f"📖 Анализ файлов...\n{progress_bar} {progress}%")
+            new_text = f"📖 Анализ файлов...\n{progress_bar} {progress}%"
+            await safe_edit_message(progress_msg, new_text)
 
-    await progress_msg.edit("🔍 Поиск глав...\n▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░ 50%")
+    await safe_edit_message(progress_msg, "🔍 Поиск глав...\n▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░ 50%")
     
     chapters = []
     title, content, num = None, "", 0
@@ -417,12 +443,13 @@ async def extract_chapters_from_epub_async(epub_path, event):
         if processed_blocks % 5 == 0:  # Обновляем каждые 5 блоков
             progress = 50 + int((processed_blocks / total_blocks) * 25)
             progress_bar = "▓" * (progress // 5) + "░" * (20 - progress // 5)
-            await progress_msg.edit(f"🔍 Поиск глав...\n{progress_bar} {progress}%")
+            new_text = f"🔍 Поиск глав...\n{progress_bar} {progress}%"
+            await safe_edit_message(progress_msg, new_text)
     
     if title:
         chapters.append((num, title, content.strip()))
 
-    await progress_msg.edit("🔄 Обработка результатов...\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░ 75%")
+    await safe_edit_message(progress_msg, "🔄 Обработка результатов...\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░ 75%")
     
     seen, result = set(), []
     for n, t, c in sorted(chapters, key=lambda x: x[0]):
@@ -430,9 +457,10 @@ async def extract_chapters_from_epub_async(epub_path, event):
             result.append((n, t, c))
             seen.add(t)
     
-    await progress_msg.edit(f"✅ Найдено глав: {len(result)}\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 100%")
+    await safe_edit_message(progress_msg, f"✅ Найдено глав: {len(result)}\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 100%")
     await asyncio.sleep(1)
     await progress_msg.delete()
+    last_message_text.pop(progress_msg.id, None)
     
     return result, images
 
@@ -453,7 +481,8 @@ async def build_epub_async(title, chapters, image_paths, output_path, progress_m
     for fname, path in image_paths.items():
         current_step += 1
         progress_bar = create_progress_bar(current_step, total_steps)
-        await progress_msg.edit(f"📚 Добавление изображений...\n{progress_bar}")
+        new_text = f"📚 Добавление изображений...\n{progress_bar}"
+        await safe_edit_message(progress_msg, new_text)
         
         ext = os.path.splitext(fname)[1][1:].lower()
         mime = f"image/{'jpeg' if ext in ['jpg', 'jpeg'] else ext}"
@@ -464,7 +493,8 @@ async def build_epub_async(title, chapters, image_paths, output_path, progress_m
     for i, (num, chapter_title, html_body) in enumerate(chapters, 1):
         current_step += 1
         progress_bar = create_progress_bar(current_step, total_steps)
-        await progress_msg.edit(f"📚 Добавление глав...\n{progress_bar}")
+        new_text = f"📚 Добавление глав...\n{progress_bar}"
+        await safe_edit_message(progress_msg, new_text)
         
         html = epub.EpubHtml(title=chapter_title, file_name=f"chap_{i}.xhtml", lang='ru')
         html.content = html_body
@@ -475,7 +505,7 @@ async def build_epub_async(title, chapters, image_paths, output_path, progress_m
     # Финальная сборка
     current_step += 1
     progress_bar = create_progress_bar(current_step, total_steps)
-    await progress_msg.edit(f"📚 Создание оглавления...\n{progress_bar}")
+    await safe_edit_message(progress_msg, f"📚 Создание оглавления...\n{progress_bar}")
     
     book.spine = spine
     book.toc = toc
@@ -484,42 +514,13 @@ async def build_epub_async(title, chapters, image_paths, output_path, progress_m
     
     current_step += 1
     progress_bar = create_progress_bar(current_step, total_steps)
-    await progress_msg.edit(f"📚 Сохранение EPUB...\n{progress_bar}")
+    await safe_edit_message(progress_msg, f"📚 Сохранение EPUB...\n{progress_bar}")
     
     epub.write_epub(output_path, book)
     
     current_step += 1
     progress_bar = create_progress_bar(current_step, total_steps)
-    await progress_msg.edit(f"📚 Завершение...\n{progress_bar}")
-
-def build_epub(title, chapters, image_paths, output_path):
-    book = epub.EpubBook()
-    book.set_identifier("converted")
-    book.set_title(title)
-    book.set_language("ru")
-    book.add_author("Chronos Bot")
-
-    spine = ['nav']
-    toc = []
-
-    for fname, path in image_paths.items():
-        ext = os.path.splitext(fname)[1][1:].lower()
-        mime = f"image/{'jpeg' if ext in ['jpg', 'jpeg'] else ext}"
-        with open(path, 'rb') as f:
-            book.add_item(epub.EpubItem(uid=fname, file_name=f"images/{fname}", media_type=mime, content=f.read()))
-
-    for i, (num, title, html_body) in enumerate(chapters, 1):
-        html = epub.EpubHtml(title=title, file_name=f"chap_{i}.xhtml", lang='ru')
-        html.content = html_body
-        book.add_item(html)
-        spine.append(html)
-        toc.append(epub.Link(html.file_name, title, f"chap_{i}"))
-
-    book.spine = spine
-    book.toc = toc
-    book.add_item(epub.EpubNcx())
-    book.add_item(epub.EpubNav())
-    epub.write_epub(output_path, book)
+    await safe_edit_message(progress_msg, f"📚 Завершение...\n{progress_bar}")
 
 # Запуск
 client.start()
