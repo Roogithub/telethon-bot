@@ -8,6 +8,7 @@ import logging
 import warnings
 import asyncio
 import shutil  # Добавлено для удаления временных директорий
+from collections import deque
 
 from telethon import TelegramClient, events, Button
 from telethon.errors import MessageNotModifiedError
@@ -38,12 +39,64 @@ user_files = {}
 user_mode = {}
 last_message_text = {}
 
+# Система очереди - ИЗМЕНЕНО на 1
+MAX_CONCURRENT_TASKS = 1  # Только один файл обрабатывается одновременно
+active_tasks = 0
+task_queue = deque()
+queue_lock = asyncio.Lock()
+
 # Новое регулярное выражение для поиска глав
 CHAPTER_RE = re.compile(
     r"(?i)^\s*("
     r"Глава|chapter|часть|пролог|аннотация|annotation|описание|предисловие от автора"
     r")", re.IGNORECASE
 )
+
+# Декоратор для управления очередью
+async def queue_manager(func):
+    """Декоратор для управления очередью обработки"""
+    async def wrapper(*args, **kwargs):
+        global active_tasks
+        
+        async with queue_lock:
+            # Если слот занят, добавляем в очередь
+            if active_tasks >= MAX_CONCURRENT_TASKS:
+                # Создаем Future для ожидания
+                future = asyncio.Future()
+                task_queue.append(future)
+                
+                # Уведомляем пользователя о позиции в очереди
+                event = args[0]
+                queue_position = len(task_queue)
+                await event.respond(
+                    f"⏳ Ваш запрос добавлен в очередь.\n"
+                    f"Позиция в очереди: {queue_position}\n"
+                    f"Ожидайте обработки..."
+                )
+                
+                # Освобождаем блокировку перед ожиданием
+                queue_lock.release()
+                try:
+                    await future
+                finally:
+                    await queue_lock.acquire()
+            
+            active_tasks += 1
+        
+        try:
+            # Выполняем основную функцию
+            result = await func(*args, **kwargs)
+            return result
+        finally:
+            async with queue_lock:
+                active_tasks -= 1
+                
+                # Если есть задачи в очереди, запускаем следующую
+                if task_queue:
+                    next_task = task_queue.popleft()
+                    next_task.set_result(True)
+    
+    return wrapper
 
 # Функция для создания прогресс-бара
 def create_progress_bar(current, total, width=20):
@@ -82,6 +135,8 @@ async def start(event):
         "Возможности:\n"
         "• Сжатие или удаление изображений в .epub, .fb2, .docx\n"
         "• Извлечение глав из EPUB, FB2, DOCX и пересборка с оглавлением\n\n"
+        "⚠️ Бот работает на бесплатном сервере.\n"
+        "Файлы обрабатываются строго по очереди.\n\n"
         "Используйте /help для получения списка команд."
     )
 
@@ -94,7 +149,22 @@ async def help_command(event):
         "/compress - Сжать или удалить изображения в .epub/.fb2/.docx\n"
         "/extract  - Извлечь главы и пересобрать с оглавлением\n"
         "/cancel   - Отменить текущую операцию\n"
+        "/status   - Проверить статус очереди\n"
     )
+
+@client.on(events.NewMessage(pattern='/status'))
+async def status_command(event):
+    """Показывает текущий статус очереди"""
+    status_text = "📊 Статус системы:\n\n"
+    
+    if active_tasks > 0:
+        status_text += "🔄 Сейчас обрабатывается файл\n"
+    else:
+        status_text += "✅ Бот свободен\n"
+    
+    status_text += f"⏳ В очереди: {len(task_queue)} файл(ов)"
+    
+    await event.respond(status_text)
 
 @client.on(events.NewMessage(pattern='/cancel'))
 async def cancel(event):
@@ -159,58 +229,64 @@ async def handle_file(event):
         await event.respond("Выберите способ обработки изображений:", buttons=buttons)
 
     elif mode == 'extract' and ext in ['.epub', '.fb2', '.docx']:
-        await event.respond("Файл получен. Начинаю обработку...")
-        try:
-            base = os.path.splitext(filename)[0]
-            output_path = None
+        await process_extract_with_queue(event, user_id, filename, tmp_path, ext)
+
+# Обработка извлечения с очередью
+@queue_manager
+async def process_extract_with_queue(event, user_id, filename, tmp_path, ext):
+    """Обработка извлечения глав с учетом очереди"""
+    await event.respond("✅ Файл принят в обработку. Начинаю...")
+    try:
+        base = os.path.splitext(filename)[0]
+        output_path = None
+        
+        if ext == '.epub':
+            chapters, images = await extract_chapters_from_epub_async(tmp_path, event)
+            if not chapters:
+                await event.respond("Главы не найдены в EPUB.")
+                return
+            output_path = os.path.join(tempfile.gettempdir(), f"{base}_converted.epub")
+            build_progress = await event.respond("📚 Сборка EPUB...\n░░░░░░░░░░░░░░░░░░░░ 0%")
+            await build_epub_async(base, chapters, images, output_path, build_progress)
+            await build_progress.delete()
+            last_message_text.pop(build_progress.id, None)
+            await client.send_file(user_id, output_path, caption="✅ EPUB пересобран с оглавлением.")
             
-            if ext == '.epub':
-                chapters, images = await extract_chapters_from_epub_async(tmp_path, event)
-                if not chapters:
-                    await event.respond("Главы не найдены в EPUB.")
-                    return
-                output_path = os.path.join(tempfile.gettempdir(), f"{base}_converted.epub")
-                build_progress = await event.respond("📚 Сборка EPUB...\n░░░░░░░░░░░░░░░░░░░░ 0%")
-                await build_epub_async(base, chapters, images, output_path, build_progress)
-                await build_progress.delete()
-                last_message_text.pop(build_progress.id, None)
-                await client.send_file(user_id, output_path, caption="✅ EPUB пересобран с оглавлением.")
-                
-            elif ext == '.fb2':
-                chapters = await extract_chapters_from_fb2_async(tmp_path, event)
-                if not chapters:
-                    await event.respond("Главы не найдены в FB2.")
-                    return
-                output_path = os.path.join(tempfile.gettempdir(), f"{base}_converted.fb2")
-                build_progress = await event.respond("📚 Сборка FB2...\n░░░░░░░░░░░░░░░░░░░░ 0%")
-                await build_fb2_with_toc_async(base, chapters, output_path, build_progress)
-                await build_progress.delete()
-                last_message_text.pop(build_progress.id, None)
-                await client.send_file(user_id, output_path, caption="✅ FB2 пересобран с оглавлением.")
-                
-            elif ext == '.docx':
-                chapters = await extract_chapters_from_docx_async(tmp_path, event)
-                if not chapters:
-                    await event.respond("Главы не найдены в DOCX.")
-                    return
-                output_path = os.path.join(tempfile.gettempdir(), f"{base}_converted.docx")
-                build_progress = await event.respond("📚 Сборка DOCX...\n░░░░░░░░░░░░░░░░░░░░ 0%")
-                await build_docx_with_toc_async(base, chapters, output_path, build_progress)
-                await build_progress.delete()
-                last_message_text.pop(build_progress.id, None)
-                await client.send_file(user_id, output_path, caption="✅ DOCX пересобран с оглавлением.")
+        elif ext == '.fb2':
+            chapters = await extract_chapters_from_fb2_async(tmp_path, event)
+            if not chapters:
+                await event.respond("Главы не найдены в FB2.")
+                return
+            output_path = os.path.join(tempfile.gettempdir(), f"{base}_converted.fb2")
+            build_progress = await event.respond("📚 Сборка FB2...\n░░░░░░░░░░░░░░░░░░░░ 0%")
+            await build_fb2_with_toc_async(base, chapters, output_path, build_progress)
+            await build_progress.delete()
+            last_message_text.pop(build_progress.id, None)
+            await client.send_file(user_id, output_path, caption="✅ FB2 пересобран с оглавлением.")
             
-            if output_path and os.path.exists(output_path):
-                os.remove(output_path)
-                
-        except Exception as e:
-            logging.error(f"Error processing file: {e}", exc_info=True)
-            await event.respond(f"Ошибка: {e}")
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            user_mode.pop(user_id, None)
-            user_files.pop(user_id, None)
+        elif ext == '.docx':
+            chapters = await extract_chapters_from_docx_async(tmp_path, event)
+            if not chapters:
+                await event.respond("Главы не найдены в DOCX.")
+                return
+            output_path = os.path.join(tempfile.gettempdir(), f"{base}_converted.docx")
+            build_progress = await event.respond("📚 Сборка DOCX...\n░░░░░░░░░░░░░░░░░░░░ 0%")
+            await build_docx_with_toc_async(base, chapters, output_path, build_progress)
+            await build_progress.delete()
+            last_message_text.pop(build_progress.id, None)
+            await client.send_file(user_id, output_path, caption="✅ DOCX пересобран с оглавлением.")
+        
+        if output_path and os.path.exists(output_path):
+            os.remove(output_path)
+            
+    except Exception as e:
+        logging.error(f"Error processing file: {e}", exc_info=True)
+        await event.respond(f"Ошибка: {e}")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        user_mode.pop(user_id, None)
+        user_files.pop(user_id, None)
 
 # Inline-кнопки
 @client.on(events.CallbackQuery)
@@ -231,14 +307,23 @@ async def handle_button(event):
     if mode == 'compress':
         resolution = RESOLUTIONS.get(data)
         await event.edit(f"⚙️ Подготовка к обработке файла {filename}...")
-        if ext == '.fb2':
-            await process_fb2(event, user_id, filename, filepath, resolution)
-        elif ext == '.docx':
-            await process_docx(event, user_id, filename, filepath, resolution)
-        elif ext == '.epub':
-            await process_epub_compression(event, user_id, filename, filepath, resolution)
+        await process_compression_with_queue(event, user_id, filename, filepath, resolution, ext)
 
-    os.remove(filepath)
+# Обработка сжатия с очередью
+@queue_manager
+async def process_compression_with_queue(event, user_id, filename, filepath, resolution, ext):
+    """Обработка сжатия изображений с учетом очереди"""
+    await event.edit("✅ Файл принят в обработку. Начинаю...")
+    
+    if ext == '.fb2':
+        await process_fb2(event, user_id, filename, filepath, resolution)
+    elif ext == '.docx':
+        await process_docx(event, user_id, filename, filepath, resolution)
+    elif ext == '.epub':
+        await process_epub_compression(event, user_id, filename, filepath, resolution)
+    
+    if os.path.exists(filepath):
+        os.remove(filepath)
     user_files.pop(user_id, None)
     user_mode.pop(user_id, None)
 
@@ -781,4 +866,5 @@ async def build_docx_with_toc_async(title, chapters, output_path, progress_msg):
 # Запуск
 client.start()
 print("Бот запущен.")
+print("Обработка файлов: строго по очереди")
 client.run_until_disconnected()
