@@ -44,6 +44,7 @@ CHAPTER_RE = re.compile(
     r")", re.IGNORECASE
 )
 
+# --- Вспомогательные функции ---
 
 def create_progress_bar(current, total, width=20):
     if total == 0:
@@ -69,6 +70,8 @@ async def safe_edit_message(message, new_text):
         pass
     except Exception as e:
         logging.error(f"Error editing message: {e}")
+
+# --- Команды Бота ---
 
 @client.on(events.NewMessage(pattern='/start'))
 async def start(event):
@@ -108,6 +111,8 @@ async def extract_cmd(event):
     user_mode[event.sender_id] = 'extract'
     await event.respond("Пожалуйста, отправьте файл .epub, .fb2 или .docx. Я извлеку главы и пересоберу его с оглавлением.")
 
+# --- Обработчики Файлов и Кнопок ---
+
 @client.on(events.NewMessage(incoming=True))
 async def handle_file(event):
     if not event.file:
@@ -120,17 +125,29 @@ async def handle_file(event):
     filename = event.file.name or ''
     ext = os.path.splitext(filename)[1].lower()
 
-    progress_msg = await event.respond("📥 Загрузка файла...")
+    progress_msg = await event.respond("📥 Загрузка файла...\n░░░░░░░░░░░░░░░░░░░░ 0%")
     file_data = io.BytesIO()
-    await client.download_media(event.message, file=file_data)
+    last_percent = 0
+
+    async def progress_callback(current, total):
+        nonlocal last_percent
+        if total > 0 and should_update_progress(current, total, last_percent):
+            progress_bar = create_progress_bar(current, total)
+            new_text = f"📥 Загрузка файла...\n{progress_bar}"
+            await safe_edit_message(progress_msg, new_text)
+            last_percent = int((current / total) * 100)
+
+    await client.download_media(event.message, file=file_data, progress_callback=progress_callback)
     file_data.seek(0)
-    
+    await safe_edit_message(progress_msg, "📥 Загрузка завершена! Сохранение файла...")
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(file_data.read())
         tmp_path = tmp.name
-    
+
     user_files[user_id] = (filename, tmp_path)
     await progress_msg.delete()
+    last_message_text.pop(progress_msg.id, None)
 
     if mode == 'compress' and ext in ['.epub', '.fb2', '.docx']:
         buttons = [Button.inline(label, data=label.encode()) for label in RESOLUTIONS]
@@ -142,42 +159,40 @@ async def handle_file(event):
             output_path = None
             caption = "Файл обработан."
             base = os.path.splitext(filename)[0]
+            build_progress = await event.respond("📖 Анализ файла...")
 
             if ext == '.epub':
-                chapters, images = await extract_chapters_from_epub_async(tmp_path, event)
+                chapters, images = await extract_chapters_from_epub_async(tmp_path, build_progress)
                 if not chapters:
-                    await event.respond("Главы не найдены.")
+                    await build_progress.edit("Главы не найдены.")
                     return
                 output_path = os.path.join(tempfile.gettempdir(), f"{base}_converted.epub")
-                build_progress = await event.respond("📚 Сборка EPUB...")
                 await build_epub_async(base, chapters, images, output_path, build_progress)
                 caption = "✅ EPUB пересобран с оглавлением."
 
             elif ext == '.fb2':
-                chapters = await extract_chapters_from_fb2_async(tmp_path, event)
+                chapters = await extract_chapters_from_fb2_async(tmp_path, build_progress)
                 if not chapters:
-                    await event.respond("Главы не найдены в FB2. Убедитесь, что в файле есть теги <section> с <title>.")
+                    await build_progress.edit("Главы не найдены в FB2. Убедитесь, что в файле есть теги <section> с <title>.")
                     return
                 output_path = os.path.join(tempfile.gettempdir(), f"{base}_converted.fb2")
-                build_progress = await event.respond("📚 Сборка FB2...")
                 await build_fb2_with_toc_async(base, chapters, output_path, build_progress)
                 caption = "✅ FB2 пересобран с оглавлением."
 
             elif ext == '.docx':
-                chapters = await extract_chapters_from_docx_async(tmp_path, event)
+                chapters = await extract_chapters_from_docx_async(tmp_path, build_progress)
                 if not chapters:
-                    await event.respond("Главы не найдены в DOCX. Поиск ведется по ключевым словам в начале параграфа.")
+                    await build_progress.edit("Главы не найдены в DOCX. Поиск ведется по ключевым словам в начале параграфа.")
                     return
                 output_path = os.path.join(tempfile.gettempdir(), f"{base}_converted.docx")
-                build_progress = await event.respond("📚 Сборка DOCX...")
                 await build_docx_with_toc_async(base, chapters, output_path, build_progress)
                 caption = "✅ DOCX пересобран с оглавлением."
-            
+
             if output_path and os.path.exists(output_path):
                 await build_progress.delete()
                 await client.send_file(user_id, output_path, caption=caption)
                 os.remove(output_path)
-                
+
         except Exception as e:
             logging.error(f"Error processing file for extraction: {e}", exc_info=True)
             await event.respond(f"Произошла ошибка при обработке файла: {e}")
@@ -220,7 +235,7 @@ async def handle_button(event):
             user_files.pop(user_id, None)
             user_mode.pop(user_id, None)
 
-# ... (Код функций сжатия process_fb2, process_docx, process_epub_compression остается без изменений) ...
+# --- Функции Сжатия Изображений ---
 
 async def process_fb2(event, user_id, filename, filepath, resolution):
     ns = {'fb2': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
@@ -234,7 +249,7 @@ async def process_fb2(event, user_id, filename, filepath, resolution):
         await event.edit("Изображения не найдены в файле.")
         return
     progress_msg = await event.respond(f"🖼️ Обработка изображений FB2...")
-    for current, binary in enumerate(image_binaries, 1):
+    for binary in image_binaries:
         if resolution is None:
             root.remove(binary)
             deleted += 1
@@ -260,43 +275,46 @@ async def process_fb2(event, user_id, filename, filepath, resolution):
 async def process_docx(event, user_id, filename, filepath, resolution):
     doc = Document(filepath)
     changed = deleted = 0
-    total = len(doc.inline_shapes)
-    if total == 0:
+    if resolution is None:
+        # Сложно и опасно удалять все изображения, так как они могут быть частью разметки.
+        # Пока просто сжимаем до минимального размера, если выбрано удаление.
+        resolution_to_use = (1, 1) if resolution is None else resolution
+        action = "удалены"
+    else:
+        resolution_to_use = resolution
+        action = "сжаты"
+
+    inline_shapes = doc.inline_shapes
+    if not inline_shapes:
         await event.edit("Изображения не найдены в документе.")
         return
+
     progress_msg = await event.respond(f"🖼️ Обработка изображений DOCX...")
-    if resolution is None:
-        for shape in doc.inline_shapes:
-            try:
-                shape._element.getparent().remove(shape._element)
-                deleted += 1
-            except Exception: continue
-    else:
-        for shape in doc.inline_shapes:
-            try:
-                r_id = shape._inline.graphic.graphicData.pic.blipFill.blip.embed
-                img_part = doc.part.related_parts[r_id]
-                img = Image.open(io.BytesIO(img_part.blob)).convert('RGB')
-                img.thumbnail(resolution, Image.Resampling.LANCZOS)
-                buf = io.BytesIO()
-                img.save(buf, format='JPEG', quality=30)
-                img_part._blob = buf.getvalue()
-                changed += 1
-            except Exception: continue
+    for shape in inline_shapes:
+        try:
+            r_id = shape._inline.graphic.graphicData.pic.blipFill.blip.embed
+            img_part = doc.part.related_parts[r_id]
+            img = Image.open(io.BytesIO(img_part.blob)).convert('RGB')
+            img.thumbnail(resolution_to_use, Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=10 if resolution is None else 30)
+            img_part._blob = buf.getvalue()
+            changed += 1
+        except Exception:
+            continue
     await safe_edit_message(progress_msg, "💾 Сохранение документа...")
     base, ext = os.path.splitext(filename)
     out_path = os.path.join(tempfile.gettempdir(), f"{base}_compressed{ext}")
     doc.save(out_path)
     await progress_msg.delete()
-    await client.send_file(user_id, out_path, caption=f"✅ Готово: сжато {changed}, удалено {deleted}")
+    await client.send_file(user_id, out_path, caption=f"✅ Готово: {changed} изображений {action}")
     os.remove(out_path)
 
 async def process_epub_compression(event, user_id, filename, filepath, resolution):
     book = epub.read_epub(filepath)
     changed = deleted = 0
     images = [item for item in list(book.get_items()) if item.media_type and item.media_type.startswith("image/")]
-    total = len(images)
-    if total == 0:
+    if not images:
         await event.edit("Изображения не найдены в EPUB.")
         return
     progress_msg = await event.respond(f"🖼️ Обработка изображений EPUB...")
@@ -313,7 +331,8 @@ async def process_epub_compression(event, user_id, filename, filepath, resolutio
                 item.content = buf.getvalue()
                 item.media_type = "image/jpeg"
                 changed += 1
-            except Exception: continue
+            except Exception:
+                continue
     await safe_edit_message(progress_msg, "💾 Сохранение EPUB...")
     base, ext = os.path.splitext(filename)
     out_path = os.path.join(tempfile.gettempdir(), f"{base}_compressed{ext}")
@@ -321,123 +340,144 @@ async def process_epub_compression(event, user_id, filename, filepath, resolutio
     await progress_msg.delete()
     await client.send_file(user_id, out_path, caption=f"✅ Готово: сжато {changed}, удалено {deleted}")
     os.remove(out_path)
-    
-# ... (Функция extract_chapters_from_epub_async остается без изменений) ...
+
+# --- Функции Извлечения и Сборки Глав ---
+
+# EPUB
 async def extract_chapters_from_epub_async(epub_path, event):
-    # ... (старый код без изменений)
-    return result, images
+    temp_dir = tempfile.mkdtemp()
+    html_blocks = []
+    images = {}
+    await safe_edit_message(event, "📖 Извлечение файлов из EPUB...")
+    with zipfile.ZipFile(epub_path, 'r') as zf:
+        zf.extractall(temp_dir)
+
+    for root, _, files in os.walk(temp_dir):
+        for file in files:
+            file_path = os.path.join(root, file)
+            if file.lower().endswith((".xhtml", ".html", ".htm")):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    html_blocks.append(BeautifulSoup(f, "lxml"))
+            elif file.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp")):
+                images[file] = file_path
+
+    await safe_edit_message(event, "🔍 Поиск глав в EPUB...")
+    chapters, title, content = [], None, ""
+    for soup in html_blocks:
+        if not soup.body: continue
+        for elem in soup.body.find_all(recursive=False):
+            text = elem.get_text(strip=True)
+            if CHAPTER_RE.match(text):
+                if title: chapters.append((len(chapters), title, content.strip()))
+                title = text
+                content = f"<h1>{title}</h1>"
+            elif title:
+                content += str(elem)
+    if title: chapters.append((len(chapters), title, content.strip()))
+    return chapters, images
 
 async def build_epub_async(title, chapters, image_paths, output_path, progress_msg):
-    # ... (старый код без изменений)
-    pass
+    await safe_edit_message(progress_msg, "📚 Сборка EPUB...")
+    book = epub.EpubBook()
+    book.set_identifier("converted")
+    book.set_title(title)
+    book.set_language("ru")
+    spine, toc = ['nav'], []
+    for fname, path in image_paths.items():
+        ext = os.path.splitext(fname)[1][1:].lower()
+        mime = f"image/{'jpeg' if ext in ['jpg', 'jpeg'] else ext}"
+        with open(path, 'rb') as f:
+            book.add_item(epub.EpubItem(uid=fname, file_name=f"images/{fname}", media_type=mime, content=f.read()))
+    for i, (num, chapter_title, html_body) in enumerate(chapters, 1):
+        html = epub.EpubHtml(title=chapter_title, file_name=f"chap_{i}.xhtml", lang='ru')
+        html.content = html_body
+        book.add_item(html)
+        spine.append(html)
+        toc.append(epub.Link(html.file_name, chapter_title, f"chap_{i}"))
+    book.spine = spine
+    book.toc = toc
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    await safe_edit_message(progress_msg, "💾 Сохранение EPUB...")
+    epub.write_epub(output_path, book)
 
-# ---- ИСПРАВЛЕННЫЕ ФУНКЦИИ ----
-
+# FB2
 async def extract_chapters_from_fb2_async(fb2_path, event):
-    """Извлекает главы из FB2, считая каждую секцию с заголовком главой."""
     await safe_edit_message(event, "📖 Анализ структуры FB2...")
     ns = {'fb2': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
     tree = etree.parse(fb2_path)
     root = tree.getroot()
-    
     chapters = []
-    # Ищем все секции, у которых есть заголовок
     sections = root.xpath('//fb2:section[fb2:title]', namespaces=ns)
-    
     for idx, section in enumerate(sections):
         title_elem = section.find('fb2:title', namespaces=ns)
         if title_elem is not None:
-            # Получаем полный текст заголовка
             title_text = ' '.join(title_elem.itertext()).strip()
-            # Получаем полное содержимое секции как строку
             content = etree.tostring(section, encoding='unicode', method='xml')
             chapters.append((idx, title_text, content))
-            
-    await event.edit(f"✅ Найдено глав в FB2: {len(chapters)}")
-    await asyncio.sleep(1)
     return chapters
 
 async def build_fb2_with_toc_async(title, chapters, output_path, progress_msg):
-    """Собирает FB2 из готовых секций-глав."""
-    await safe_edit_message(progress_msg, "📚 Создание структуры FB2...")
+    await safe_edit_message(progress_msg, "📚 Сборка FB2...")
     nsmap = {'fb2': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
     root = etree.Element('FictionBook', nsmap=nsmap)
-    
     description = etree.SubElement(root, 'description')
     title_info = etree.SubElement(description, 'title-info')
     etree.SubElement(title_info, 'book-title').text = title
     etree.SubElement(title_info, 'lang').text = 'ru'
-    
     body = etree.SubElement(root, 'body')
-    
     for idx, (num, chapter_title, content_xml) in enumerate(chapters):
         try:
-            # Парсим XML-строку главы и добавляем ее в тело
             section_node = etree.fromstring(content_xml)
             body.append(section_node)
         except Exception as e:
-            logging.error(f"Could not parse chapter '{chapter_title}': {e}")
-            continue # Пропускаем главу, если не удалось ее распарсить
-            
+            logging.error(f"Could not parse FB2 chapter '{chapter_title}': {e}")
+            continue
     await safe_edit_message(progress_msg, "💾 Сохранение FB2...")
     tree = etree.ElementTree(root)
     tree.write(output_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
 
+# DOCX
 async def extract_chapters_from_docx_async(docx_path, event):
-    """Извлекает главы из DOCX файла по ключевым словам в начале параграфа."""
     await safe_edit_message(event, "📖 Анализ структуры DOCX...")
     doc = Document(docx_path)
-    chapters = []
-    current_chapter_title = None
-    current_content = []
-
+    chapters, current_chapter_title, current_content = [], None, []
     for para in doc.paragraphs:
-        # Проверяем, является ли параграф заголовком главы
         if CHAPTER_RE.match(para.text.strip()):
-            # Если это новый заголовок, сохраняем предыдущую главу
             if current_chapter_title is not None:
                 chapters.append((len(chapters), current_chapter_title, "\n".join(current_content)))
-                current_content = []
-            
-            # Начинаем новую главу
             current_chapter_title = para.text.strip()
-        
-        # Если мы внутри главы, добавляем текст
-        if current_chapter_title is not None:
+            current_content = [current_chapter_title] # Включаем сам заголовок в контент
+        elif current_chapter_title is not None:
             current_content.append(para.text)
-    
-    # Добавляем последнюю найденную главу
     if current_chapter_title is not None:
         chapters.append((len(chapters), current_chapter_title, "\n".join(current_content)))
-        
-    await event.edit(f"✅ Найдено глав в DOCX: {len(chapters)}")
-    await asyncio.sleep(1)
     return chapters
 
 async def build_docx_with_toc_async(title, chapters, output_path, progress_msg):
-    """Создает DOCX файл с оглавлением без лишних разрывов страниц."""
     doc = Document()
     doc.add_heading(title, 0)
-    
     await safe_edit_message(progress_msg, "📚 Создание оглавления DOCX...")
     doc.add_heading('Оглавление', 1)
     for num, chapter_title, _ in sorted(chapters, key=lambda x: x[0]):
-        # Добавляем пункт оглавления как обычный параграф
-        doc.add_paragraph(f"{chapter_title}")
-    
+        doc.add_paragraph(f"{chapter_title}", style='List Bullet')
+    doc.add_page_break()
     await safe_edit_message(progress_msg, "📚 Добавление глав DOCX...")
     for num, chapter_title, content in sorted(chapters, key=lambda x: x[0]):
-        doc.add_heading(chapter_title, 1)
-        # Добавляем параграфы главы
+        # Содержимое уже включает заголовок, так что просто добавляем параграфы
         for paragraph_text in content.split('\n'):
-             if paragraph_text.strip(): # Добавляем только непустые параграфы
-                doc.add_paragraph(paragraph_text)
-                
+            if paragraph_text.strip():
+                # Первый параграф (заголовок) делаем жирным
+                if paragraph_text == chapter_title:
+                    p = doc.add_paragraph()
+                    p.add_run(paragraph_text).bold = True
+                else:
+                    doc.add_paragraph(paragraph_text)
     await safe_edit_message(progress_msg, "💾 Сохранение DOCX...")
     doc.save(output_path)
 
-# Запуск
+# --- Запуск Бота ---
+
 client.start()
 print("Бот запущен.")
-client.run_until_disconnected()
-                
+client
