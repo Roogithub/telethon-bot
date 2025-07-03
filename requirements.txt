@@ -1,6 +1,1 @@
 telethon
-ebooklib
-beautifulsoup4
-lxml
-pillow
-python-docx
