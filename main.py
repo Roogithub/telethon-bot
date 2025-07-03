@@ -7,7 +7,7 @@ import base64
 import logging
 import warnings
 import asyncio
-import shutil  # Добавлено для удаления временных директорий
+import shutil
 from collections import deque
 
 from telethon import TelegramClient, events, Button
@@ -39,33 +39,32 @@ user_files = {}
 user_mode = {}
 last_message_text = {}
 
-# Система очереди - ИЗМЕНЕНО на 1
-MAX_CONCURRENT_TASKS = 1  # Только один файл обрабатывается одновременно
+# Система очереди
+MAX_CONCURRENT_TASKS = 1
 active_tasks = 0
 task_queue = deque()
 queue_lock = asyncio.Lock()
 
-# Новое регулярное выражение для поиска глав
+# Улучшенное регулярное выражение для поиска глав
 CHAPTER_RE = re.compile(
     r"(?i)^\s*("
-    r"Глава|chapter|часть|пролог|аннотация|annotation|описание|предисловие от автора"
-    r")", re.IGNORECASE
+    r"Глава|chapter|часть|part|том|volume|книга|book|раздел|section|"
+    r"пролог|prologue|эпилог|epilogue|предисловие|введение|заключение|"
+    r"примечания|приложение|аннотация|annotation|описание"
+    r")[\s\.:]*(\d+|[IVX]+|[А-Я])?", re.IGNORECASE | re.UNICODE
 )
 
 # Декоратор для управления очередью
-def queue_manager(func):
+async def queue_manager(func):
     """Декоратор для управления очередью обработки"""
     async def wrapper(*args, **kwargs):
         global active_tasks
         
         async with queue_lock:
-            # Если слот занят, добавляем в очередь
             if active_tasks >= MAX_CONCURRENT_TASKS:
-                # Создаем Future для ожидания
                 future = asyncio.Future()
                 task_queue.append(future)
                 
-                # Уведомляем пользователя о позиции в очереди
                 event = args[0]
                 queue_position = len(task_queue)
                 await event.respond(
@@ -74,7 +73,6 @@ def queue_manager(func):
                     f"Ожидайте обработки..."
                 )
                 
-                # Освобождаем блокировку перед ожиданием
                 queue_lock.release()
                 try:
                     await future
@@ -84,20 +82,17 @@ def queue_manager(func):
             active_tasks += 1
         
         try:
-            # Выполняем основную функцию
             result = await func(*args, **kwargs)
             return result
         finally:
             async with queue_lock:
                 active_tasks -= 1
                 
-                # Если есть задачи в очереди, запускаем следующую
                 if task_queue:
                     next_task = task_queue.popleft()
                     next_task.set_result(True)
     
-    return wrapper  # Возвращаем wrapper, а не вызываем его 
-            
+    return wrapper
 
 # Функция для создания прогресс-бара
 def create_progress_bar(current, total, width=20):
@@ -135,7 +130,8 @@ async def start(event):
         "Здравствуйте. Вас приветствует Адикия — бот для работы с документами.\n\n"
         "Возможности:\n"
         "• Сжатие или удаление изображений в .epub, .fb2, .docx\n"
-        "• Извлечение глав из EPUB, FB2, DOCX и пересборка с оглавлением\n\n"
+        "• Извлечение глав из EPUB, FB2, DOCX и пересборка с оглавлением\n"
+        "• Проверка и исправление ошибок в файлах\n\n"
         "⚠️ Бот работает на бесплатном сервере.\n"
         "Файлы обрабатываются строго по очереди.\n\n"
         "Используйте /help для получения списка команд."
@@ -147,8 +143,9 @@ async def help_command(event):
         "Справка по командам:\n\n"
         "/start    - Начать работу с ботом\n"
         "/help     - Показать эту справку\n"
-        "/compress - Сжать или удалить изображения в .epub/.fb2/.docx\n"
+        "/compress - Сжать или удалить изображения\n"
         "/extract  - Извлечь главы и пересобрать с оглавлением\n"
+        "/fix      - Проверка и исправление ошибок\n"
         "/cancel   - Отменить текущую операцию\n"
         "/status   - Проверить статус очереди\n"
     )
@@ -183,6 +180,14 @@ async def compress_cmd(event):
 async def extract_cmd(event):
     user_mode[event.sender_id] = 'extract'
     await event.respond("Пожалуйста, отправьте файл .epub, .fb2 или .docx. Я извлеку главы и пересоберу его с оглавлением.")
+
+@client.on(events.NewMessage(pattern='/fix'))
+async def fix_cmd(event):
+    user_mode[event.sender_id] = 'fix'
+    await event.respond(
+        "🔧 Функция проверки и починки файлов\n\n"
+        "Отправьте файл .epub, .fb2 или .docx для диагностики и исправления ошибок."
+    )
 
 # Приём файлов с прогресс-баром
 @client.on(events.NewMessage(incoming=True))
@@ -231,6 +236,9 @@ async def handle_file(event):
 
     elif mode == 'extract' and ext in ['.epub', '.fb2', '.docx']:
         await process_extract_with_queue(event, user_id, filename, tmp_path, ext)
+        
+    elif mode == 'fix' and ext in ['.epub', '.fb2', '.docx']:
+        await process_fix_with_queue(event, user_id, filename, tmp_path, ext)
 
 # Обработка извлечения с очередью
 @queue_manager
@@ -288,6 +296,24 @@ async def process_extract_with_queue(event, user_id, filename, tmp_path, ext):
             os.remove(tmp_path)
         user_mode.pop(user_id, None)
         user_files.pop(user_id, None)
+
+# Обработка валидации с очередью
+@queue_manager
+async def process_fix_with_queue(event, user_id, filename, filepath, ext):
+    """Обработка валидации и починки с учетом очереди"""
+    await event.respond("🔧 Начинаю диагностику файла...")
+    try:
+        if ext == '.fb2':
+            await process_fb2_fix(event, user_id, filename, filepath)
+        elif ext == '.docx':
+            await process_docx_fix(event, user_id, filename, filepath)
+        elif ext == '.epub':
+            await process_epub_fix(event, user_id, filename, filepath)
+    finally:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        user_files.pop(user_id, None)
+        user_mode.pop(user_id, None)
 
 # Inline-кнопки
 @client.on(events.CallbackQuery)
@@ -355,10 +381,8 @@ async def process_fb2(event, user_id, filename, filepath, resolution):
             last_percent = int((current / total) * 100)
 
         if resolution is None:
-            # Удаляем ссылки на изображение из текста
             binary_id = binary.get('id')
             if binary_id:
-                # Удаляем все ссылки на это изображение
                 for img_ref in root.xpath(f'//fb2:image[@l:href="#{binary_id}"]', 
                                         namespaces={'fb2': ns['fb2'], 'l': 'http://www.w3.org/1999/xlink'}):
                     img_ref.getparent().remove(img_ref)
@@ -401,7 +425,6 @@ async def process_docx(event, user_id, filename, filepath, resolution):
     last_percent = 0
 
     if resolution is None:
-        # Создаем список для удаления в обратном порядке
         shapes_to_remove = []
         for current, shape in enumerate(doc.inline_shapes, 1):
             if should_update_progress(current, total, last_percent):
@@ -411,7 +434,6 @@ async def process_docx(event, user_id, filename, filepath, resolution):
                 last_percent = int((current / total) * 100)
             shapes_to_remove.append(shape)
         
-        # Удаляем в обратном порядке чтобы не нарушить индексацию
         for shape in reversed(shapes_to_remove):
             try:
                 shape._element.getparent().remove(shape._element)
@@ -554,7 +576,7 @@ async def extract_chapters_from_epub_async(epub_path, event):
                 if match:
                     if title:
                         chapters.append((num, title, content.strip()))
-                    title = text  # Используем полный текст, не только match.group(1)
+                    title = text
                     num_match = re.search(r'\d+', title)
                     num = int(num_match.group()) if num_match else len(chapters)
                     content = f"<h1>{title}</h1>"
@@ -573,10 +595,9 @@ async def extract_chapters_from_epub_async(epub_path, event):
 
         await safe_edit_message(progress_msg, "🔄 Обработка результатов...\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░ 75%")
         
-        # Фильтруем пустые главы и дубликаты
         seen, result = set(), []
         for n, t, c in sorted(chapters, key=lambda x: x[0]):
-            if t not in seen and len(c.strip()) > len(f"<h1>{t}</h1>"):  # Проверяем что есть контент кроме заголовка
+            if t not in seen and len(c.strip()) > len(f"<h1>{t}</h1>"):
                 result.append((n, t, c))
                 seen.add(t)
         
@@ -588,7 +609,6 @@ async def extract_chapters_from_epub_async(epub_path, event):
         return result, images
         
     finally:
-        # Очищаем временную директорию
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
@@ -597,7 +617,7 @@ async def build_epub_async(title, chapters, image_paths, output_path, progress_m
     book.set_identifier("converted")
     book.set_title(title)
     book.set_language("ru")
-    book.add_author("Adikia Bot")  # Изменено с Chronos Bot
+    book.add_author("Adikia Bot")
 
     spine = ['nav']
     toc = []
@@ -605,7 +625,6 @@ async def build_epub_async(title, chapters, image_paths, output_path, progress_m
     total_steps = len(image_paths) + len(chapters) + 3
     current_step = 0
 
-    # Добавление изображений
     for fname, path in image_paths.items():
         current_step += 1
         progress_bar = create_progress_bar(current_step, total_steps)
@@ -620,7 +639,6 @@ async def build_epub_async(title, chapters, image_paths, output_path, progress_m
         except Exception as e:
             logging.warning(f"Could not add image {fname}: {e}")
 
-    # Добавление глав
     for i, (num, chapter_title, html_body) in enumerate(chapters, 1):
         current_step += 1
         progress_bar = create_progress_bar(current_step, total_steps)
@@ -633,7 +651,6 @@ async def build_epub_async(title, chapters, image_paths, output_path, progress_m
         spine.append(html)
         toc.append(epub.Link(html.file_name, chapter_title, f"chap_{i}"))
 
-    # Финальная сборка
     current_step += 1
     progress_bar = create_progress_bar(current_step, total_steps)
     await safe_edit_message(progress_msg, f"📚 Создание оглавления...\n{progress_bar}")
@@ -653,9 +670,9 @@ async def build_epub_async(title, chapters, image_paths, output_path, progress_m
     progress_bar = create_progress_bar(current_step, total_steps)
     await safe_edit_message(progress_msg, f"📚 Завершение...\n{progress_bar}")
 
-# Функция для извлечения глав из FB2
+# УЛУЧШЕННАЯ функция для извлечения глав из FB2
 async def extract_chapters_from_fb2_async(fb2_path, event):
-    """Извлекает главы из FB2 файла"""
+    """Улучшенное извлечение глав из FB2 файла"""
     progress_msg = await event.respond("📖 Анализ структуры FB2...\n░░░░░░░░░░░░░░░░░░░░ 0%")
     
     try:
@@ -666,42 +683,122 @@ async def extract_chapters_from_fb2_async(fb2_path, event):
         await safe_edit_message(progress_msg, "📖 Поиск глав в FB2...\n▓▓▓▓▓░░░░░░░░░░░░░░░ 25%")
         
         chapters = []
-        # Ищем все секции с заголовками
+        
+        # Метод 1: Ищем секции с заголовками
         sections = root.xpath('//fb2:section[fb2:title]', namespaces=ns)
-        total = len(sections)
         
-        if total == 0:
-            await safe_edit_message(progress_msg, "❌ Секции с заголовками не найдены")
-            await asyncio.sleep(2)
-            await progress_msg.delete()
-            return []
-        
-        for idx, section in enumerate(sections):
-            if idx % 5 == 0:
-                progress = 25 + int((idx / total) * 50)
-                progress_bar = "▓" * (progress // 5) + "░" * (20 - progress // 5)
-                await safe_edit_message(progress_msg, f"📖 Обработка секций...\n{progress_bar} {progress}%")
+        # Метод 2: Если секций мало, ищем все параграфы с паттернами глав
+        if len(sections) < 3:
+            await safe_edit_message(progress_msg, "🔍 Глубокий поиск глав...\n▓▓▓▓▓▓▓▓░░░░░░░░░░░░ 40%")
             
-            # Получаем заголовок
-            title_elem = section.find('.//fb2:title', namespaces=ns)
-            if title_elem is not None:
-                title_text = ' '.join(title_elem.itertext()).strip()
+            # Собираем все текстовые элементы
+            all_paragraphs = root.xpath('//fb2:p', namespaces=ns)
+            current_chapter = None
+            current_content = []
+            chapter_num = 0
+            
+            for para in all_paragraphs:
+                text = ''.join(para.itertext()).strip()
                 
-                # Извлекаем содержимое секции
-                content = etree.tostring(section, encoding='unicode', pretty_print=True)
+                # Проверяем, является ли параграф заголовком главы
+                if text and CHAPTER_RE.match(text):
+                    # Сохраняем предыдущую главу
+                    if current_chapter and current_content:
+                        # Создаем XML структуру для главы
+                        section_xml = f'<section xmlns="{ns["fb2"]}">'
+                        section_xml += f'<title><p>{current_chapter}</p></title>'
+                        section_xml += ''.join(current_content)
+                        section_xml += '</section>'
+                        
+                        chapters.append((chapter_num, current_chapter, section_xml))
+                    
+                    # Начинаем новую главу
+                    current_chapter = text
+                    num_match = re.search(r'\d+', text)
+                    chapter_num = int(num_match.group()) if num_match else chapter_num + 1
+                    current_content = []
+                elif current_chapter:
+                    # Добавляем параграф к текущей главе
+                    para_str = etree.tostring(para, encoding='unicode', pretty_print=True)
+                    current_content.append(para_str)
+            
+            # Добавляем последнюю главу
+            if current_chapter and current_content:
+                section_xml = f'<section xmlns="{ns["fb2"]}">'
+                section_xml += f'<title><p>{current_chapter}</p></title>'
+                section_xml += ''.join(current_content)
+                section_xml += '</section>'
                 
-                # Извлекаем номер главы если есть
-                num_match = re.search(r'\d+', title_text)
-                num = int(num_match.group()) if num_match else idx
-                
-                chapters.append((num, title_text, content))
+                chapters.append((chapter_num, current_chapter, section_xml))
         
-        await safe_edit_message(progress_msg, f"✅ Найдено глав: {len(chapters)}\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 100%")
+        else:
+            # Обрабатываем найденные секции
+            total = len(sections)
+            
+            for idx, section in enumerate(sections):
+                if idx % 5 == 0:
+                    progress = 25 + int((idx / total) * 50)
+                    progress_bar = "▓" * (progress // 5) + "░" * (20 - progress // 5)
+                    await safe_edit_message(progress_msg, f"📖 Обработка секций...\n{progress_bar} {progress}%")
+                
+                # Получаем заголовок
+                title_elem = section.find('.//fb2:title', namespaces=ns)
+                if title_elem is not None:
+                    # Извлекаем текст заголовка, учитывая вложенные элементы
+                    title_text = ' '.join(title_elem.itertext()).strip()
+                    
+                    # Проверяем, не является ли это просто номером
+                    if title_text and (len(title_text) > 2 or not title_text.isdigit()):
+                        # Извлекаем содержимое секции
+                        content = etree.tostring(section, encoding='unicode', pretty_print=True)
+                        
+                        # Извлекаем номер главы если есть
+                        num_match = re.search(r'\d+', title_text)
+                        num = int(num_match.group()) if num_match else idx
+                        
+                        chapters.append((num, title_text, content))
+        
+        # Проверяем вложенные секции
+        if len(chapters) < 3:
+            await safe_edit_message(progress_msg, "🔍 Поиск вложенных глав...\n▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░ 65%")
+            
+            # Ищем секции внутри body
+            body_sections = root.xpath('//fb2:body/fb2:section', namespaces=ns)
+            for section in body_sections:
+                # Ищем вложенные секции с заголовками
+                nested_sections = section.xpath('.//fb2:section[fb2:title]', namespaces=ns)
+                
+                for nested in nested_sections:
+                    title_elem = nested.find('.//fb2:title', namespaces=ns)
+                    if title_elem is not None:
+                        title_text = ' '.join(title_elem.itertext()).strip()
+                        
+                        if title_text and CHAPTER_RE.match(title_text):
+                            content = etree.tostring(nested, encoding='unicode', pretty_print=True)
+                            num_match = re.search(r'\d+', title_text)
+                            num = int(num_match.group()) if num_match else len(chapters)
+                            
+                            # Проверяем, что эта глава еще не добавлена
+                            if not any(ch[1] == title_text for ch in chapters):
+                                chapters.append((num, title_text, content))
+        
+        # Сортируем главы по номерам
+        chapters.sort(key=lambda x: x[0])
+        
+        # Убираем дубликаты
+        unique_chapters = []
+        seen_titles = set()
+        for num, title, content in chapters:
+            if title not in seen_titles:
+                unique_chapters.append((num, title, content))
+                seen_titles.add(title)
+        
+        await safe_edit_message(progress_msg, f"✅ Найдено глав: {len(unique_chapters)}\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 100%")
         await asyncio.sleep(1)
         await progress_msg.delete()
         last_message_text.pop(progress_msg.id, None)
         
-        return chapters
+        return unique_chapters
         
     except Exception as e:
         logging.error(f"Error parsing FB2: {e}")
@@ -715,47 +812,38 @@ async def build_fb2_with_toc_async(title, chapters, output_path, progress_msg):
     """Создает FB2 файл с правильным оглавлением"""
     ns = {'fb2': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
     
-    # Создаем базовую структуру FB2
     root = etree.Element('{http://www.gribuser.ru/xml/fictionbook/2.0}FictionBook', 
                         nsmap={None: ns['fb2']})
     root.set('{http://www.w3.org/2001/XMLSchema-instance}schemaLocation', 
              'http://www.gribuser.ru/xml/fictionbook/2.0 http://www.gribuser.ru/xml/fictionbook/2.0/FictionBook2.xsd')
     
-    # Описание документа
     description = etree.SubElement(root, 'description')
     title_info = etree.SubElement(description, 'title-info')
     etree.SubElement(title_info, 'book-title').text = title
     etree.SubElement(title_info, 'lang').text = 'ru'
     
-    # Тело документа
     body = etree.SubElement(root, 'body')
     
     total = len(chapters)
     
-    # Добавляем главы
     for idx, (num, chapter_title, content) in enumerate(chapters):
         progress = int((idx / total) * 100)
         progress_bar = create_progress_bar(idx, total)
         await safe_edit_message(progress_msg, f"📚 Сборка FB2...\n{progress_bar}")
         
-        # Парсим содержимое главы
         try:
-            # Удаляем объявление XML если есть
             content = content.replace('<?xml version="1.0" encoding="utf-8"?>', '')
             section = etree.fromstring(content)
-            # Убираем namespace из элементов
             for elem in section.iter():
                 elem.tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
             body.append(section)
         except Exception as e:
             logging.error(f"Could not parse chapter content: {e}")
-            # Если не удалось распарсить, создаем новую секцию
             section = etree.SubElement(body, 'section')
             section_title = etree.SubElement(section, 'title')
             p = etree.SubElement(section_title, 'p')
             p.text = chapter_title
     
-    # Сохраняем файл
     await safe_edit_message(progress_msg, "💾 Сохранение FB2...\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 100%")
     tree = etree.ElementTree(root)
     tree.write(output_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
@@ -779,22 +867,18 @@ async def extract_chapters_from_docx_async(docx_path, event):
                 progress_bar = create_progress_bar(idx, total)
                 await safe_edit_message(progress_msg, f"📖 Анализ параграфов...\n{progress_bar}")
             
-            # Проверяем, является ли параграф заголовком главы
             text = para.text.strip()
             if text and (para.style.name.startswith('Heading') or CHAPTER_RE.match(text)):
-                # Сохраняем предыдущую главу
                 if current_chapter and current_content:
                     num_match = re.search(r'\d+', current_chapter)
                     num = int(num_match.group()) if num_match else len(chapters)
                     chapters.append((num, current_chapter, '\n'.join(current_content)))
                 
-                # Начинаем новую главу
                 current_chapter = text
-                current_content = []  # Не включаем заголовок в контент
-            elif current_chapter and text:  # Добавляем только непустые параграфы
+                current_content = []
+            elif current_chapter and text:
                 current_content.append(text)
         
-        # Добавляем последнюю главу
         if current_chapter and current_content:
             num_match = re.search(r'\d+', current_chapter)
             num = int(num_match.group()) if num_match else len(chapters)
@@ -819,50 +903,326 @@ async def build_docx_with_toc_async(title, chapters, output_path, progress_msg):
     """Создает DOCX файл с оглавлением"""
     doc = Document()
     
-    # Добавляем заголовок документа
     doc.add_heading(title, 0)
-    
-    # Добавляем оглавление
     doc.add_heading('Оглавление', 1)
     
     total_steps = len(chapters) * 2 + 2
     current_step = 0
     
-    # Создаем список глав для оглавления
     for num, chapter_title, _ in sorted(chapters, key=lambda x: x[0]):
         current_step += 1
         progress_bar = create_progress_bar(current_step, total_steps)
         await safe_edit_message(progress_msg, f"📚 Создание оглавления...\n{progress_bar}")
         
-        # Добавляем пункт оглавления
         doc.add_paragraph(f"{num + 1}. {chapter_title}", style='List Number')
     
-    # Добавляем разрыв страницы после оглавления
     doc.add_page_break()
     
-    # Добавляем главы
     for num, chapter_title, content in sorted(chapters, key=lambda x: x[0]):
         current_step += 1
         progress_bar = create_progress_bar(current_step, total_steps)
         await safe_edit_message(progress_msg, f"📚 Добавление глав...\n{progress_bar}")
         
-        # Добавляем заголовок главы
         doc.add_heading(chapter_title, 1)
         
-        # Добавляем содержимое главы
         paragraphs = content.split('\n')
         for paragraph in paragraphs:
             if paragraph.strip():
                 doc.add_paragraph(paragraph)
-        
-        # НЕ добавляем разрыв страницы после каждой главы для экономии места
     
-    # Сохраняем документ
     current_step += 1
     progress_bar = create_progress_bar(current_step, total_steps)
     await safe_edit_message(progress_msg, f"💾 Сохранение DOCX...\n{progress_bar}")
     
     doc.save(output_path)
+
+# Функции валидации и починки
+
+async def process_fb2_fix(event, user_id, filename, filepath):
+    """Валидация и починка FB2"""
+    report = "📋 Отчет о проверке FB2:\n\n"
+    fixed_issues = []
+    
+    progress_msg = await event.respond("🔧 Анализ структуры FB2...\n░░░░░░░░░░░░░░░░░░░░ 0%")
+    
+    try:
+        ns = {'fb2': 'http://www.gribuser.ru/xml/fictionbook/2.0'}
+        tree = etree.parse(filepath)
+        root = tree.getroot()
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка структуры...\n▓▓▓▓░░░░░░░░░░░░░░░░ 20%")
+        
+        if not root.find('.//fb2:description', namespaces=ns):
+            report += "❌ Отсутствует элемент description\n"
+            description = etree.SubElement(root, '{%s}description' % ns['fb2'])
+            title_info = etree.SubElement(description, '{%s}title-info' % ns['fb2'])
+            etree.SubElement(title_info, '{%s}book-title' % ns['fb2']).text = "Без названия"
+            etree.SubElement(title_info, '{%s}lang' % ns['fb2']).text = "ru"
+            fixed_issues.append("Добавлен элемент description")
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка изображений...\n▓▓▓▓▓▓▓▓░░░░░░░░░░░░ 40%")
+        
+        image_refs = root.xpath('//fb2:image', namespaces=ns)
+        binaries = {b.get('id'): b for b in root.xpath('//fb2:binary', namespaces=ns)}
+        
+        broken_images = 0
+        for img in image_refs:
+            href = img.get('{http://www.w3.org/1999/xlink}href')
+            if href and href.startswith('#'):
+                binary_id = href[1:]
+                if binary_id not in binaries:
+                    img.getparent().remove(img)
+                    broken_images += 1
+        
+        if broken_images > 0:
+            report += f"🖼️ Удалено битых ссылок на изображения: {broken_images}\n"
+            fixed_issues.append(f"Удалено {broken_images} битых изображений")
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка пустых элементов...\n▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░ 60%")
+        
+        empty_elements = 0
+        for elem in root.xpath('.//*', namespaces=ns):
+            if elem.tag.endswith('p') and not elem.text and not elem.tail and len(elem) == 0:
+                elem.getparent().remove(elem)
+                empty_elements += 1
+        
+        if empty_elements > 0:
+            report += f"📄 Удалено пустых параграфов: {empty_elements}\n"
+            fixed_issues.append(f"Удалено {empty_elements} пустых элементов")
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка кодировки...\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░ 80%")
+        
+        for elem in root.xpath('.//*', namespaces=ns):
+            if elem.text:
+                elem.text = elem.text.replace('РІ', 'в').replace('вЂ"', '—').replace('вЂ™', ''')
+            if elem.tail:
+                elem.tail = elem.tail.replace('РІ', 'в').replace('вЂ"', '—').replace('вЂ™', ''')
+        
+        await safe_edit_message(progress_msg, "💾 Сохранение исправленного файла...")
+        
+        if fixed_issues:
+            base, ext = os.path.splitext(filename)
+            out_path = os.path.join(tempfile.gettempdir(), f"{base}_fixed{ext}")
+            tree.write(out_path, encoding='utf-8', xml_declaration=True, pretty_print=True)
+            
+            report += f"\n✅ Исправлено проблем: {len(fixed_issues)}\n"
+            report += "\n".join(f"• {issue}" for issue in fixed_issues)
+            
+            await progress_msg.delete()
+            await client.send_file(user_id, out_path, caption=report)
+            os.remove(out_path)
+        else:
+            report += "\n✅ Проблем не обнаружено!"
+            await progress_msg.delete()
+            await event.respond(report)
+            
+    except etree.XMLSyntaxError as e:
+        await progress_msg.delete()
+        await event.respond(
+            f"❌ Критическая ошибка XML:\n{str(e)}\n\n"
+            "Файл серьезно поврежден и требует ручного исправления."
+        )
+    except Exception as e:
+        await progress_msg.delete()
+        await event.respond(f"❌ Ошибка при проверке: {e}")
+
+async def process_docx_fix(event, user_id, filename, filepath):
+    """Валидация и починка DOCX"""
+    report = "📋 Отчет о проверке DOCX:\n\n"
+    fixed_issues = []
+    
+    progress_msg = await event.respond("🔧 Анализ документа DOCX...\n░░░░░░░░░░░░░░░░░░░░ 0%")
+    
+    try:
+        doc = Document(filepath)
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка пустых параграфов...\n▓▓▓▓▓░░░░░░░░░░░░░░░ 25%")
+        
+        empty_paras = 0
+        paras_to_remove = []
+        
+        for para in doc.paragraphs:
+            if not para.text.strip():
+                has_images = any(run._element.xpath('.//w:drawing') for run in para.runs)
+                if not has_images:
+                    paras_to_remove.append(para)
+                    empty_paras += 1
+        
+        for para in paras_to_remove:
+            p = para._element
+            p.getparent().remove(p)
+        
+        if empty_paras > 0:
+            report += f"📄 Удалено пустых параграфов: {empty_paras}\n"
+            fixed_issues.append(f"Удалено {empty_paras} пустых параграфов")
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка стилей...\n▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░ 50%")
+        
+        fixed_styles = 0
+        for para in doc.paragraphs:
+            if para.style is None or para.style.name == 'Normal':
+                if CHAPTER_RE.match(para.text):
+                    para.style = 'Heading 1'
+                    fixed_styles += 1
+        
+        if fixed_styles > 0:
+            report += f"🎨 Исправлено стилей заголовков: {fixed_styles}\n"
+            fixed_issues.append(f"Исправлено {fixed_styles} стилей")
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка изображений...\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░ 75%")
+        
+        broken_images = 0
+        for shape in doc.inline_shapes:
+            try:
+                _ = shape._inline.graphic.graphicData
+            except:
+                broken_images += 1
+        
+        if broken_images > 0:
+            report += f"🖼️ Обнаружено битых изображений: {broken_images}\n"
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка списков...\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 100%")
+        
+        total_paras = len(doc.paragraphs)
+        total_tables = len(doc.tables)
+        total_sections = len(doc.sections)
+        
+        report += f"\n📊 Статистика документа:\n"
+        report += f"• Параграфов: {total_paras}\n"
+        report += f"• Таблиц: {total_tables}\n"
+        report += f"• Секций: {total_sections}\n"
+        
+        if fixed_issues:
+            base, ext = os.path.splitext(filename)
+            out_path = os.path.join(tempfile.gettempdir(), f"{base}_fixed{ext}")
+            doc.save(out_path)
+            
+            report += f"\n✅ Исправлено проблем: {len(fixed_issues)}\n"
+            report += "\n".join(f"• {issue}" for issue in fixed_issues)
+            
+            await progress_msg.delete()
+            await client.send_file(user_id, out_path, caption=report)
+            os.remove(out_path)
+        else:
+            report += "\n✅ Проблем не обнаружено!"
+            await progress_msg.delete()
+            await event.respond(report)
+            
+    except Exception as e:
+        await progress_msg.delete()
+        await event.respond(f"❌ Ошибка при проверке: {e}")
+
+async def process_epub_fix(event, user_id, filename, filepath):
+    """Валидация и починка EPUB"""
+    report = "📋 Отчет о проверке EPUB:\n\n"
+    fixed_issues = []
+    
+    progress_msg = await event.respond("🔧 Анализ структуры EPUB...\n░░░░░░░░░░░░░░░░░░░░ 0%")
+    
+    try:
+        book = epub.read_epub(filepath)
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка метаданных...\n▓▓▓▓░░░░░░░░░░░░░░░░ 20%")
+        
+        if not book.get_metadata('DC', 'title'):
+            book.set_title('Без названия')
+            fixed_issues.append("Добавлено название книги")
+            
+        if not book.get_metadata('DC', 'language'):
+            book.set_language('ru')
+            fixed_issues.append("Добавлен язык")
+            
+        if not book.get_metadata('DC', 'identifier'):
+            book.set_identifier(f'urn:uuid:{os.urandom(16).hex()}')
+            fixed_issues.append("Добавлен идентификатор")
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка изображений...\n▓▓▓▓▓▓▓▓░░░░░░░░░░░░ 40%")
+        
+        images = list(book.get_items_of_type(ebooklib.ITEM_IMAGE))
+        broken_images = []
+        
+        for img in images:
+            try:
+                Image.open(io.BytesIO(img.content))
+            except:
+                broken_images.append(img)
+        
+        if broken_images:
+            for img in broken_images:
+                book.items.remove(img)
+            report += f"🖼️ Удалено битых изображений: {len(broken_images)}\n"
+            fixed_issues.append(f"Удалено {len(broken_images)} битых изображений")
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка HTML контента...\n▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░ 60%")
+        
+        documents = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+        fixed_html = 0
+        
+        for item in documents:
+            try:
+                content = item.get_content().decode('utf-8')
+                soup = BeautifulSoup(content, 'html.parser')
+                
+                for tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                    if not tag.get_text(strip=True):
+                        tag.decompose()
+                        fixed_html += 1
+                
+                for img in soup.find_all('img'):
+                    src = img.get('src')
+                    if src:
+                        img_name = os.path.basename(src)
+                        if not any(i.file_name.endswith(img_name) for i in images):
+                            img.decompose()
+                            fixed_html += 1
+                
+                item.set_content(str(soup).encode('utf-8'))
+                
+            except Exception as e:
+                report += f"⚠️ Ошибка в файле {item.file_name}: {str(e)}\n"
+        
+        if fixed_html > 0:
+            report += f"📄 Исправлено HTML элементов: {fixed_html}\n"
+            fixed_issues.append(f"Исправлено {fixed_html} HTML элементов")
+        
+        await safe_edit_message(progress_msg, "🔧 Проверка навигации...\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░ 80%")
+        
+        spine_items = []
+        for item_id, linear in book.spine:
+            try:
+                item = book.get_item_with_id(item_id)
+                if item:
+                    spine_items.append((item_id, linear))
+            except:
+                fixed_issues.append(f"Удалена битая ссылка из spine: {item_id}")
+        
+        book.spine = spine_items
+        
+        report += f"\n📊 Статистика EPUB:\n"
+        report += f"• HTML файлов: {len(documents)}\n"
+        report += f"• Изображений: {len(images) - len(broken_images)}\n"
+        report += f"• Элементов в spine: {len(spine_items)}\n"
+        
+        if fixed_issues:
+            await safe_edit_message(progress_msg, "💾 Сохранение исправленного EPUB...")
+            base, ext = os.path.splitext(filename)
+            out_path = os.path.join(tempfile.gettempdir(), f"{base}_fixed{ext}")
+            epub.write_epub(out_path, book)
+            
+            report += f"\n✅ Исправлено проблем: {len(fixed_issues)}\n"
+            report += "\n".join(f"• {issue}" for issue in fixed_issues)
+            
+            await progress_msg.delete()
+            await client.send_file(user_id, out_path, caption=report)
+            os.remove(out_path)
+        else:
+            report += "\n✅ Проблем не обнаружено!"
+            await progress_msg.delete()
+            await event.respond(report)
+            
+    except Exception as e:
+        await progress_msg.delete()
+        await event.respond(f"❌ Ошибка при проверке: {e}")
 
 # Запуск
 client.start()
