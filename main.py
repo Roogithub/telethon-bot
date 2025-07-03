@@ -53,7 +53,7 @@ CHAPTER_RE = re.compile(
 )
 
 # Декоратор для управления очередью
-async def queue_manager(func):
+def queue_manager(func):
     """Декоратор для управления очередью обработки"""
     async def wrapper(*args, **kwargs):
         global active_tasks
@@ -96,7 +96,8 @@ async def queue_manager(func):
                     next_task = task_queue.popleft()
                     next_task.set_result(True)
     
-    return wrapper
+    return wrapper  # Возвращаем wrapper, а не вызываем его 
+            
 
 # Функция для создания прогресс-бара
 def create_progress_bar(current, total, width=20):
