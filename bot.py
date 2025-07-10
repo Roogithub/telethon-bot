@@ -104,7 +104,7 @@ class UserLimits:
         self.user_locks = {} # Словарь для хранения блокировок пользователей
         self.max_files = max_files
         self.max_size = max_size
-        self.admins = [5787446293, 5491435817]
+        self.admins = [5787446293, 5491435817, 5536200506]
 
     def _get_last_utc_midnight(self):
         """Возвращает последнюю полночь по UTC."""
